@@ -1,23 +1,36 @@
 import type { Account, Address, Hex } from 'viem'
-import { encodeFunctionData, getAddress } from 'viem'
+import { decodeFunctionData, encodeFunctionData, getAddress } from 'viem'
 
 import * as constants from '../constants'
 import {
   SafeOperation,
   type SafeOperationValue,
+  erc4626Abi,
   p2pSuperformProxyAbi,
   p2pSuperformProxyFactoryAbi,
-  rolesModuleAbi
+  rolesModuleAbi,
+  superformRouterSingleWithdrawAbi
 } from '../utils/abis'
+import { buildDepositBody, fetchDepositCalculate, fetchDepositStart } from '../utils/deposit'
+import {
+  buildProxyBatchClaimCalldata,
+  decodeRewardsDistributorBatchClaim,
+  fetchProtocolRewardsClaim as fetchProtocolRewardsClaimFromApi
+} from '../utils/rewards'
+import { buildWithdrawBody, fetchWithdrawCalculate, fetchWithdrawStart } from '../utils/withdraw'
 import type {
+  BatchClaimParams,
   DepositParams,
   ExecutorConfig,
   PredictProxyAddressParams,
   RolesExecutionParams,
+  WithdrawAccruedRewardsParams,
   WithdrawParams
 } from './types'
 
 export class P2pSafeSuperformExecutor {
+  private static readonly ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+
   private readonly walletClient: ExecutorConfig['walletClient']
   private readonly publicClient: ExecutorConfig['publicClient']
   private readonly config: Required<
@@ -25,6 +38,7 @@ export class P2pSafeSuperformExecutor {
   > &
     ExecutorConfig
   private readonly log: (message: string) => void
+  private readonly fetcher: typeof fetch
 
   constructor(config: ExecutorConfig) {
     this.walletClient = config.walletClient
@@ -35,20 +49,64 @@ export class P2pSafeSuperformExecutor {
         config.p2pSuperformProxyFactoryAddress ?? constants.P2P_SUPERFORM_PROXY_FACTORY_ADDRESS,
       p2pModuleAddress:
         config.p2pModuleAddress ??
-        config.walletClient.account?.address ??
-        constants.P2P_ADDRESS,
+        config.walletClient.account?.address ?? constants.P2P_ADDRESS,
       defaultRoleKey: config.defaultRoleKey ?? constants.DEFAULT_ROLE_KEY,
-      validateRolesTarget: config.validateRolesTarget ?? true
+      validateRolesTarget: config.validateRolesTarget ?? true,
+      superformApiKey: config.superformApiKey ?? process.env.SF_API_KEY
     }
     this.log = config.logger ?? ((message: string) => console.info(message))
+    this.fetcher = config.fetcher ?? fetch
   }
 
   async deposit(params: DepositParams): Promise<Hex> {
+    const chainId = this.walletClient.chain?.id
+    if (!chainId) {
+      throw new Error('walletClient.chain.id is required for deposit')
+    }
+    const apiKey = this.config.superformApiKey
+    if (!apiKey) {
+      throw new Error('superformApiKey (or SF_API_KEY in env) is required for deposit')
+    }
+
+    const proxyAddress = await this.predictProxyAddress({
+      client: params.safeAddress,
+      clientBasisPointsOfDeposit: params.clientBasisPointsOfDeposit,
+      clientBasisPointsOfProfit: params.clientBasisPointsOfProfit
+    })
+
+    const body = buildDepositBody({
+      userAddress: proxyAddress,
+      fromTokenAddress: params.fromTokenAddress,
+      fromChainId: chainId,
+      amountIn: params.amountIn,
+      refundAddress: proxyAddress,
+      vaultId: params.vaultId,
+      bridgeSlippage: params.bridgeSlippage,
+      swapSlippage: params.swapSlippage,
+      routeType: params.routeType,
+      excludeAmbs: params.excludeAmbs,
+      excludeLiquidityProviders: params.excludeLiquidityProviders,
+      excludeDexes: params.excludeDexes,
+      excludeBridges: params.excludeBridges
+    })
+
+    const calculateResult = await fetchDepositCalculate({
+      apiKey,
+      body,
+      fetcher: this.fetcher
+    })
+
+    const depositStart = await fetchDepositStart({
+      apiKey,
+      calculateResult,
+      fetcher: this.fetcher
+    })
+
     const depositData = encodeFunctionData({
       abi: p2pSuperformProxyFactoryAbi,
       functionName: 'deposit',
       args: [
-        params.yieldProtocolCalldata,
+        depositStart.data,
         this.normalizeUint48(params.clientBasisPointsOfDeposit, 'clientBasisPointsOfDeposit'),
         this.normalizeUint48(params.clientBasisPointsOfProfit, 'clientBasisPointsOfProfit'),
         this.normalizeBigInt(params.p2pSignerSigDeadline, 'p2pSignerSigDeadline'),
@@ -64,7 +122,11 @@ export class P2pSafeSuperformExecutor {
       rolesAddress: params.rolesAddress,
       target: this.config.p2pSuperformProxyFactoryAddress,
       data: depositData,
-      value: this.normalizeBigInt(params.value, 'value', 0n),
+      value: this.normalizeBigInt(
+        params.value ?? (depositStart.value ? BigInt(depositStart.value) : undefined),
+        'value',
+        0n
+      ),
       roleKey: params.roleKey,
       shouldRevertOnFailure: params.shouldRevertOnFailure,
       operation: params.operation,
@@ -73,10 +135,50 @@ export class P2pSafeSuperformExecutor {
   }
 
   async withdraw(params: WithdrawParams): Promise<Hex> {
+    const chainId = this.walletClient.chain?.id
+    if (!chainId) {
+      throw new Error('walletClient.chain.id is required for withdraw')
+    }
+    const apiKey = this.config.superformApiKey
+    if (!apiKey) {
+      throw new Error('superformApiKey (or SF_API_KEY in env) is required for withdraw')
+    }
+
+    const body = buildWithdrawBody({
+      userAddress: params.p2pSuperformProxyAddress,
+      refundAddress: params.p2pSuperformProxyAddress,
+      superformId: params.superformId,
+      superpositionsAmountIn: params.superpositionsAmountIn,
+      superpositionsChainId: chainId,
+      toChainId: chainId,
+      toTokenAddress: params.toTokenAddress,
+      vaultId: params.vaultId,
+      bridgeSlippage: params.bridgeSlippage,
+      swapSlippage: params.swapSlippage,
+      positiveSlippage: params.positiveSlippage,
+      isErc20: params.isErc20,
+      routeType: params.routeType,
+      filterSwapRoutes: params.filterSwapRoutes,
+      isPartOfMultiVault: params.isPartOfMultiVault,
+      needInsurance: params.needInsurance
+    })
+
+    const calculateResult = await fetchWithdrawCalculate({
+      apiKey,
+      body,
+      fetcher: this.fetcher
+    })
+
+    const withdrawStart = await fetchWithdrawStart({
+      apiKey,
+      calculateResult,
+      fetcher: this.fetcher
+    })
+
     const withdrawData = encodeFunctionData({
       abi: p2pSuperformProxyAbi,
       functionName: 'withdraw',
-      args: [params.superformCalldata]
+      args: [withdrawStart.data]
     })
 
     this.log(
@@ -87,6 +189,86 @@ export class P2pSafeSuperformExecutor {
       rolesAddress: params.rolesAddress,
       target: params.p2pSuperformProxyAddress,
       data: withdrawData,
+      value: this.normalizeBigInt(
+        params.value ?? (withdrawStart.value ? BigInt(withdrawStart.value) : undefined),
+        'value',
+        0n
+      ),
+      roleKey: params.roleKey,
+      shouldRevertOnFailure: params.shouldRevertOnFailure,
+      operation: params.operation,
+      expectedSafe: params.safeAddress
+    })
+  }
+
+  async withdrawAccruedRewards(params: WithdrawAccruedRewardsParams): Promise<Hex> {
+    const parsed = this.decodeSingleDirectSingleVaultWithdraw(params.superformCalldata)
+    const { superformId, amount, liqRequest } = parsed.superformData
+    const asset = await this.resolveAssetForWithdraw(superformId, liqRequest.token)
+
+    const accruedRewards = (await this.publicClient.readContract({
+      address: params.p2pSuperformProxyAddress,
+      abi: p2pSuperformProxyAbi,
+      functionName: 'calculateAccruedRewards',
+      args: [superformId, asset]
+    })) as bigint
+
+    if (accruedRewards <= 0n) {
+      throw new Error(
+        `No accrued rewards available for superformId=${superformId.toString()} asset=${asset}; got ${accruedRewards.toString()}`
+      )
+    }
+
+    const accruedRewardsPositive = BigInt(accruedRewards)
+    if (amount !== accruedRewardsPositive) {
+      throw new Error(
+        `superformCalldata amount (${amount}) must equal accrued rewards (${accruedRewardsPositive})`
+      )
+    }
+
+    const withdrawData = encodeFunctionData({
+      abi: p2pSuperformProxyAbi,
+      functionName: 'withdrawAccruedRewards',
+      args: [params.superformCalldata]
+    })
+
+    this.log(
+      `➡️  Withdraw accrued rewards via Roles ${params.rolesAddress} -> Safe ${params.safeAddress} -> Proxy ${params.p2pSuperformProxyAddress}`
+    )
+
+    return this.executeViaRoles({
+      rolesAddress: params.rolesAddress,
+      target: params.p2pSuperformProxyAddress,
+      data: withdrawData,
+      value: this.normalizeBigInt(params.value, 'value', 0n),
+      roleKey: params.roleKey,
+      shouldRevertOnFailure: params.shouldRevertOnFailure,
+      operation: params.operation,
+      expectedSafe: params.safeAddress
+    })
+  }
+
+  async batchClaim(params: BatchClaimParams): Promise<Hex> {
+    const claim = await this.fetchProtocolRewardsClaim(params.p2pSuperformProxyAddress)
+    const decoded = decodeRewardsDistributorBatchClaim(claim.transactionData)
+
+    const expectedProxy = getAddress(params.p2pSuperformProxyAddress)
+    if (decoded.receiver !== expectedProxy) {
+      throw new Error(
+        `Claim receiver ${decoded.receiver} does not match proxy ${expectedProxy} from params`
+      )
+    }
+
+    const { data } = buildProxyBatchClaimCalldata(decoded)
+
+    this.log(
+      `➡️  Batch claim via Roles ${params.rolesAddress} -> Safe ${params.safeAddress} -> Proxy ${params.p2pSuperformProxyAddress}`
+    )
+
+    return this.executeViaRoles({
+      rolesAddress: params.rolesAddress,
+      target: params.p2pSuperformProxyAddress,
+      data,
       value: this.normalizeBigInt(params.value, 'value', 0n),
       roleKey: params.roleKey,
       shouldRevertOnFailure: params.shouldRevertOnFailure,
@@ -230,5 +412,77 @@ export class P2pSafeSuperformExecutor {
         `Failed to verify Roles wiring for ${rolesAddress}: ${(error as Error).message}`
       )
     }
+  }
+
+  private decodeSingleDirectSingleVaultWithdraw(data: Hex) {
+    const decoded = decodeFunctionData({
+      abi: superformRouterSingleWithdrawAbi,
+      data
+    })
+
+    if (decoded.functionName !== 'singleDirectSingleVaultWithdraw') {
+      throw new Error('superformCalldata selector must be singleDirectSingleVaultWithdraw')
+    }
+
+    // decoded.args[0] is the req_ struct
+    return decoded.args[0] as {
+      superformData: {
+        superformId: bigint
+        amount: bigint
+        outputAmount: bigint
+        maxSlippage: bigint
+        liqRequest: {
+          txData: Hex
+          token: Address
+          interimToken: Address
+          bridgeId: number
+          liqDstChainId: bigint
+          nativeAmount: bigint
+        }
+        permit2data: Hex
+        hasDstSwap: boolean
+        retain4626: boolean
+        receiverAddress: Address
+        receiverAddressSP: Address
+        extraFormData: Hex
+      }
+    }
+  }
+
+  private async resolveAssetForWithdraw(superformId: bigint, liqRequestToken: Address): Promise<Address> {
+    if (getAddress(liqRequestToken) !== P2pSafeSuperformExecutor.ZERO_ADDRESS) {
+      return getAddress(liqRequestToken)
+    }
+
+    const superformAsAddress = this.superformIdToAddress(superformId)
+    const asset = await this.publicClient.readContract({
+      address: superformAsAddress,
+      abi: erc4626Abi,
+      functionName: 'asset'
+    })
+
+    return getAddress(asset as Address)
+  }
+
+  private superformIdToAddress(superformId: bigint): Address {
+    const hex = superformId.toString(16).padStart(40, '0')
+    return getAddress(`0x${hex}`)
+  }
+
+  private async fetchProtocolRewardsClaim(user: Address) {
+    const chainId = this.walletClient.chain?.id
+    if (!chainId) {
+      throw new Error('walletClient.chain.id is required to fetch rewards claim data')
+    }
+    const apiKey = this.config.superformApiKey
+    if (!apiKey) {
+      throw new Error('superformApiKey (or SF_API_KEY in env) is required to fetch rewards claim data')
+    }
+
+    return fetchProtocolRewardsClaimFromApi({
+      chainId,
+      user,
+      apiKey
+    })
   }
 }
